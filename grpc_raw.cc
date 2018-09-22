@@ -1,8 +1,9 @@
+#include <gflags/gflags.h>
+#include <sys/types.h>
+
 #include <atomic>
 #include <memory>
 #include <thread>
-
-#include <gflags/gflags.h>
 
 #include "grpcpp/completion_queue.h"
 #include "grpcpp/grpcpp.h"
@@ -17,7 +18,11 @@ char *message_buffer;
 DEFINE_int64(message_size, 100 * 1024 * 1024, "message size sent to peer");
 DEFINE_int64(total_message, 1000, "tatal messages client sent");
 DEFINE_int32(echo_steps, 1000, "steps to echo the progress");
-DEFINE_int32(client_concurrent, 1, "client concurrently sent messages");
+
+DEFINE_int32(client_channels, 1, "opening channels for client to send");
+DEFINE_int32(client_channel_concurrent, 1,
+             "client concurrently sent messages for each channels");
+
 DEFINE_int32(port, 50051, "listen port or connecting port");
 DEFINE_string(target_ip, "127.0.0.1", "the target ip client connected to");
 DEFINE_string(job_type, "server", "job type, should be client/server");
@@ -96,9 +101,8 @@ public:
   struct RpcCall {
     RpcCall(ServerImpl *super, AsyncService *s, ServerCompletionQueue *q)
         : super_(super), svc_(s), q_(q), ctx_(),
-          response_(super->TheSlice(),
-                    1), // create bytebuffer with slice to prevent memory copy
-          stream_(&ctx_),
+          // create bytebuffer with slice to prevent memory copy
+          response_(super->TheSlice(), 1), stream_(&ctx_),
           has_responsed_(false) {}
 
     void RegisterCall() {
@@ -137,35 +141,36 @@ class ClientImpl final {
 public:
   ClientImpl() : slice_(message_buffer, FLAGS_message_size), total_count(0) {}
 
-  bool SendRequest() {
+  bool SendRequest(int worker_index) {
     int count = total_count.fetch_add(1, std::memory_order_acquire);
     if (count >= FLAGS_total_message) {
       return false;
     }
     ClientRpcCall *client_call = new ClientRpcCall();
     // send a byte buffer created with slice to prevent memory copy
-    client_call->response_reader = stub->PrepareUnaryCall(
-        &client_call->ctx, "sample", ByteBuffer(&slice_, 1), &cq_);
+    client_call->response_reader = stubs_[worker_index]->PrepareUnaryCall(
+        &client_call->ctx, "sample", ByteBuffer(&slice_, 1),
+        cqs_[worker_index].get());
     client_call->response_reader->StartCall();
     client_call->response_reader->Finish(&client_call->response_data,
                                          &client_call->response_status,
                                          client_call);
     if ((count + 1) % FLAGS_echo_steps == 0) {
-      printf("has sent %d messages\n", count + 1);
+      printf("[t%d]: has sent %d messages\n", worker_index, count + 1);
     }
     return true;
   }
 
-  void HandleResponse() {
+  void HandleResponse(int worker_index) {
     void *got_tag;
     bool ok;
 
-    while (cq_.Next(&got_tag, &ok)) {
+    while (cqs_[worker_index]->Next(&got_tag, &ok)) {
       ClientRpcCall *client_call = static_cast<ClientRpcCall *>(got_tag);
       GPR_ASSERT(ok);
 
       if (client_call->response_status.ok()) {
-        if (!SendRequest())
+        if (!SendRequest(worker_index))
           break;
       } else {
         printf("rpc call got error: %s\n",
@@ -175,19 +180,36 @@ public:
     }
   }
 
+  void WorkerRun(int worker_index) {
+    for (int i = 0; i < FLAGS_client_channel_concurrent; ++i) {
+      SendRequest(worker_index);
+    }
+
+    HandleResponse(worker_index);
+  }
+
   void Run() {
-    grpc::ChannelArguments ch_args;
-    ch_args.SetMaxSendMessageSize(-1);
-    ch_args.SetMaxReceiveMessageSize(-1);
-    std::shared_ptr<Channel> ch = grpc::CreateCustomChannel(
-        FLAGS_target_ip + ":" + std::to_string(FLAGS_port),
-        grpc::InsecureChannelCredentials(), ch_args);
-    stub.reset(new GenericStub(ch));
+    for (int i = 0; i < FLAGS_client_channels; ++i) {
+      grpc::ChannelArguments ch_args;
+      ch_args.SetMaxSendMessageSize(-1);
+      ch_args.SetMaxReceiveMessageSize(-1);
+      std::shared_ptr<Channel> ch = grpc::CreateCustomChannel(
+          FLAGS_target_ip + ":" + std::to_string(FLAGS_port),
+          grpc::InsecureChannelCredentials(), ch_args);
+      stubs_.emplace_back(new GenericStub(ch));
 
-    SendRequest();
-    HandleResponse();
+      cqs_.emplace_back(new CompletionQueue());
+    }
 
-    cq_.Shutdown();
+    for (int i = 0; i < FLAGS_client_channels; ++i) {
+      workers_.emplace_back(
+          std::thread(std::bind(&ClientImpl::WorkerRun, this, i)));
+    }
+
+    for (int i = 0; i < FLAGS_client_channels; ++i) {
+      workers_[i].join();
+      cqs_[i]->Shutdown();
+    }
   }
 
   struct ClientRpcCall {
@@ -199,8 +221,9 @@ public:
 
 private:
   Slice slice_;
-  CompletionQueue cq_;
-  std::unique_ptr<GenericStub> stub;
+  std::vector<std::unique_ptr<CompletionQueue>> cqs_;
+  std::vector<std::unique_ptr<GenericStub>> stubs_;
+  std::vector<std::thread> workers_;
   std::atomic_int total_count;
 };
 

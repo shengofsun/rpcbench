@@ -2,3 +2,7 @@ build
 grpc
 build/*
 grpc/*
+*.config
+*.creator*
+*.files
+*.includes
