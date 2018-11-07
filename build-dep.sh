@@ -13,10 +13,13 @@ function build_grpc() {
 
     # 3. build/install grpc to `pwd`/output
     sed -i "/^prefix/c prefix\ \?\=\ $(pwd)\/output" Makefile
-    make -j8 && make install
+    rm -rf output
+    make clean
+    make -j8
+    make install
 
     # 4. create symbolic link for some libraries
-    ln -s $(pwd)/output/lib/libgrpc++.so.6 $(pwd)/output/lib/libgrpc++.so.1
+    ln -s $(pwd)/output/lib/libgrpc++.so $(pwd)/output/lib/libgrpc++.so.1
     
     # 5. change to parent dir
     cd ..
@@ -25,6 +28,7 @@ function build_grpc() {
 # we use gflags from grpc, so please make sure build_grpc succeed first
 function build_gflags() {
     pushd grpc/third_party/gflags > /dev/null
+    rm -rf build output
     mkdir build
     
     pushd build > /dev/null

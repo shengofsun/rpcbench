@@ -1,7 +1,10 @@
 #include <gflags/gflags.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 
@@ -30,12 +33,30 @@ DEFINE_string(job_type, "server", "job type, should be client/server");
 DEFINE_int32(server_threads, 2, "completion threads for server");
 
 void fill_buffer() {
-  for (int i = 0; i < FLAGS_message_size; ++i)
-    message_buffer[i] = 'A';
+  for (int i = 0; i < FLAGS_message_size; ++i) message_buffer[i] = 'A';
+}
+
+long gettid() { return syscall(SYS_gettid); }
+
+void log_message(const char *msg) {
+  int srclen = strlen(msg);
+  do {
+    int ans = write(1, msg, srclen);
+    srclen -= ans;
+    msg += ans;
+  } while (srclen > 0);
+}
+
+uint64_t NowNanos() {
+  auto now = std::chrono::high_resolution_clock::now();
+  auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   now.time_since_epoch())
+                   .count();
+  return nanos;
 }
 
 class AsyncService : public Service {
-public:
+ public:
   AsyncService() {
     AddMethod(new ::grpc::internal::RpcServiceMethod(
         "sample", ::grpc::internal::RpcMethod::NORMAL_RPC, nullptr));
@@ -45,7 +66,7 @@ public:
 };
 
 class ServerImpl final {
-public:
+ public:
   ServerImpl() : slice_(message_buffer, FLAGS_message_size) {}
 
   ~ServerImpl() {
@@ -57,9 +78,9 @@ public:
 
   void Run() {
     ServerBuilder builder;
-    builder.AddListeningPort(std::string("0.0.0.0:") +
-                                 std::to_string(FLAGS_port),
-                             grpc::InsecureServerCredentials());
+    builder.AddListeningPort(
+        std::string("0.0.0.0:") + std::to_string(FLAGS_port),
+        grpc::InsecureServerCredentials());
     builder.SetMaxSendMessageSize(-1);
     builder.SetMaxReceiveMessageSize(-1);
     builder.RegisterService(&service_);
@@ -69,7 +90,9 @@ public:
     }
 
     server_ = builder.BuildAndStart();
-    printf("server listening at 0.0.0.0:%d\n", FLAGS_port);
+    char buffer[128];
+    snprintf(buffer, 127, "server listening at 0.0.0.0:%d\n", FLAGS_port);
+    log_message(buffer);
 
     for (int i = 0; i < FLAGS_server_threads; ++i) {
       threads_.emplace_back(new std::thread(
@@ -88,6 +111,9 @@ public:
   }
 
   void HandleRpcs(ServerCompletionQueue *cq) {
+    char buffer[128];
+    snprintf(buffer, 127, "handle rpc with thread(%ld)\n", gettid());
+    log_message(buffer);
     AddHandler(cq);
     void *tag;
     bool ok;
@@ -100,9 +126,13 @@ public:
 
   struct RpcCall {
     RpcCall(ServerImpl *super, AsyncService *s, ServerCompletionQueue *q)
-        : super_(super), svc_(s), q_(q), ctx_(),
+        : super_(super),
+          svc_(s),
+          q_(q),
+          ctx_(),
           // create bytebuffer with slice to prevent memory copy
-          response_(super->TheSlice(), 1), stream_(&ctx_),
+          response_(super->TheSlice(), 1),
+          stream_(&ctx_),
           has_responsed_(false) {}
 
     void RegisterCall() {
@@ -129,7 +159,7 @@ public:
     bool has_responsed_;
   };
 
-private:
+ private:
   std::vector<std::unique_ptr<ServerCompletionQueue>> cqs_;
   std::vector<std::unique_ptr<std::thread>> threads_;
   std::unique_ptr<Server> server_;
@@ -138,7 +168,7 @@ private:
 };
 
 class ClientImpl final {
-public:
+ public:
   ClientImpl() : slice_(message_buffer, FLAGS_message_size), total_count(0) {}
 
   bool SendRequest(int worker_index) {
@@ -155,6 +185,7 @@ public:
     client_call->response_reader->Finish(&client_call->response_data,
                                          &client_call->response_status,
                                          client_call);
+    ++send_count_[worker_index];
     if ((count + 1) % FLAGS_echo_steps == 0) {
       printf("[t%d]: has sent %d messages\n", worker_index, count + 1);
     }
@@ -169,8 +200,10 @@ public:
       ClientRpcCall *client_call = static_cast<ClientRpcCall *>(got_tag);
       GPR_ASSERT(ok);
 
+      ++recv_count_[worker_index];
       if (client_call->response_status.ok()) {
-        if (!SendRequest(worker_index))
+        if (!SendRequest(worker_index) &&
+            send_count_[worker_index] <= recv_count_[worker_index])
           break;
       } else {
         printf("rpc call got error: %s\n",
@@ -181,6 +214,10 @@ public:
   }
 
   void WorkerRun(int worker_index) {
+    char buffer[128];
+    snprintf(buffer, 127, "run worker with thread(%ld)\n", gettid());
+    log_message(buffer);
+
     for (int i = 0; i < FLAGS_client_channel_concurrent; ++i) {
       SendRequest(worker_index);
     }
@@ -201,6 +238,10 @@ public:
       cqs_.emplace_back(new CompletionQueue());
     }
 
+    send_count_.resize(FLAGS_client_channels);
+    recv_count_.resize(FLAGS_client_channels);
+
+    uint64_t t = NowNanos();
     for (int i = 0; i < FLAGS_client_channels; ++i) {
       workers_.emplace_back(
           std::thread(std::bind(&ClientImpl::WorkerRun, this, i)));
@@ -210,6 +251,11 @@ public:
       workers_[i].join();
       cqs_[i]->Shutdown();
     }
+    t = NowNanos() - t;
+    double seconds = (t + .0) / 1000000000;
+    printf("total handled messages: %ld, throughput: %lf bps\n",
+           FLAGS_total_message,
+           FLAGS_total_message * FLAGS_message_size * 8 / seconds);
   }
 
   struct ClientRpcCall {
@@ -219,11 +265,13 @@ public:
     Status response_status;
   };
 
-private:
+ private:
   Slice slice_;
   std::vector<std::unique_ptr<CompletionQueue>> cqs_;
   std::vector<std::unique_ptr<GenericStub>> stubs_;
   std::vector<std::thread> workers_;
+  std::vector<int> send_count_;
+  std::vector<int> recv_count_;
   std::atomic_int total_count;
 };
 
