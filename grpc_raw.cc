@@ -197,8 +197,8 @@ class ServerImpl final {
   grpc::Slice slice_;
 
   std::unique_ptr<std::thread> reporter_;
-  std::atomic_uint64_t recved_bytes_{0};
-  std::atomic_uint64_t responsed_bytes_{0};
+  std::atomic<uint64_t> recved_bytes_{0};
+  std::atomic<uint64_t> responsed_bytes_{0};
 };
 
 class ClientImpl final {
@@ -335,11 +335,11 @@ class ClientImpl final {
   std::vector<std::thread> workers_;
   std::vector<int> send_count_;
   std::vector<int> responsed_count_;
-  std::atomic_int total_count;
+  std::atomic<int> total_count;
 
-  std::atomic_uint64_t total_sent_bytes_{0};
-  std::atomic_uint64_t total_responsed_bytes_{0};
-  std::atomic_bool all_finished{false};
+  std::atomic<uint64_t> total_sent_bytes_{0};
+  std::atomic<uint64_t> total_responsed_bytes_{0};
+  std::atomic<bool> all_finished{false};
   std::unique_ptr<std::thread> reporter_;
 };
 
