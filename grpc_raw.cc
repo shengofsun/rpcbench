@@ -20,8 +20,8 @@ using namespace grpc;
 char *message_buffer;
 DEFINE_int64(message_size, 100 * 1024 * 1024, "message size sent to peer");
 DEFINE_int64(total_message, 1000, "tatal messages client sent");
-DEFINE_int32(echo_steps, 1000, "steps to echo the progress");
-
+DEFINE_int64(report_interval_secs, 2,
+             "report statistics infos interval seconds");
 DEFINE_int32(client_channels, 1, "opening channels for client to send");
 DEFINE_int32(client_channel_concurrent, 1,
              "client concurrently sent messages for each channels");
@@ -98,9 +98,12 @@ class ServerImpl final {
       threads_.emplace_back(new std::thread(
           std::bind(&ServerImpl::HandleRpcs, this, cqs_[i].get())));
     }
+    reporter_.reset(new std::thread(std::bind(&ServerImpl::Report, this)));
+
     for (int i = 0; i < FLAGS_server_threads; ++i) {
       threads_[i]->join();
     }
+    reporter_->join();
   }
 
   const Slice *TheSlice() const { return &slice_; }
@@ -124,6 +127,29 @@ class ServerImpl final {
     }
   }
 
+  void Report() {
+    uint64_t n = NowNanos();
+    uint64_t recved = 0;
+    uint64_t responsed = 0;
+
+    while (true) {
+      std::this_thread::sleep_for(
+          std::chrono::seconds(FLAGS_report_interval_secs));
+
+      uint64_t new_tick = NowNanos();
+      uint64_t new_recved = recved_bytes_.load(std::memory_order_acquire);
+      uint64_t new_responsed = responsed_bytes_.load(std::memory_order_acquire);
+
+      double recv_gbps = (new_recved - recved) * 8.0 / (new_tick - n);
+      double resp_gbps = (new_responsed - responsed) * 8.0 / (new_tick - n);
+
+      n = new_tick;
+      recved = new_recved;
+      responsed = new_responsed;
+      printf("recved Gbps: %lf, responsed Gbps: %lf\n", recv_gbps, resp_gbps);
+    }
+  }
+
   struct RpcCall {
     RpcCall(ServerImpl *super, AsyncService *s, ServerCompletionQueue *q)
         : super_(super),
@@ -142,9 +168,13 @@ class ServerImpl final {
 
     void Response() {
       if (has_responsed_) {
+        super_->responsed_bytes_.fetch_add(response_.Length(),
+                                           std::memory_order_relaxed);
         delete this;
       } else {
         has_responsed_ = true;
+        super_->recved_bytes_.fetch_add(msg_.Length(),
+                                        std::memory_order_relaxed);
         stream_.Finish(response_, Status::OK, (void *)(this));
       }
     }
@@ -165,6 +195,10 @@ class ServerImpl final {
   std::unique_ptr<Server> server_;
   AsyncService service_;
   grpc::Slice slice_;
+
+  std::unique_ptr<std::thread> reporter_;
+  std::atomic_uint64_t recved_bytes_{0};
+  std::atomic_uint64_t responsed_bytes_{0};
 };
 
 class ClientImpl final {
@@ -186,9 +220,6 @@ class ClientImpl final {
                                          &client_call->response_status,
                                          client_call);
     ++send_count_[worker_index];
-    if ((count + 1) % FLAGS_echo_steps == 0) {
-      printf("[t%d]: has sent %d messages\n", worker_index, count + 1);
-    }
     return true;
   }
 
@@ -200,10 +231,13 @@ class ClientImpl final {
       ClientRpcCall *client_call = static_cast<ClientRpcCall *>(got_tag);
       GPR_ASSERT(ok);
 
-      ++recv_count_[worker_index];
+      ++responsed_count_[worker_index];
       if (client_call->response_status.ok()) {
+        total_sent_bytes_.fetch_add(slice_.size(), std::memory_order_relaxed);
+        total_responsed_bytes_.fetch_add(client_call->response_data.Length(),
+                                         std::memory_order_relaxed);
         if (!SendRequest(worker_index) &&
-            send_count_[worker_index] <= recv_count_[worker_index])
+            send_count_[worker_index] <= responsed_count_[worker_index])
           break;
       } else {
         printf("rpc call got error: %s\n",
@@ -239,7 +273,9 @@ class ClientImpl final {
     }
 
     send_count_.resize(FLAGS_client_channels);
-    recv_count_.resize(FLAGS_client_channels);
+    responsed_count_.resize(FLAGS_client_channels);
+
+    reporter_.reset(new std::thread(std::bind(&ClientImpl::Report, this)));
 
     uint64_t t = NowNanos();
     for (int i = 0; i < FLAGS_client_channels; ++i) {
@@ -252,10 +288,37 @@ class ClientImpl final {
       cqs_[i]->Shutdown();
     }
     t = NowNanos() - t;
+    all_finished.store(true, std::memory_order_release);
+
+    reporter_->join();
     double seconds = (t + .0) / 1000000000;
     printf("total handled messages: %ld, throughput: %lf bps\n",
            FLAGS_total_message,
            FLAGS_total_message * FLAGS_message_size * 8 / seconds);
+  }
+
+  void Report() {
+    uint64_t n = NowNanos();
+    uint64_t sent = 0;
+    uint64_t responsed = 0;
+
+    while (!all_finished.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(
+          std::chrono::seconds(FLAGS_report_interval_secs));
+
+      uint64_t new_tick = NowNanos();
+      uint64_t new_sent = total_sent_bytes_.load(std::memory_order_acquire);
+      uint64_t new_responsed =
+          total_responsed_bytes_.load(std::memory_order_acquire);
+
+      double sent_gbps = (new_sent - sent) * 8.0 / (new_tick - n);
+      double resp_gbps = (new_responsed - responsed) * 8.0 / (new_tick - n);
+
+      n = new_tick;
+      sent = new_sent;
+      responsed = new_responsed;
+      printf("sent Gbps: %lf, responsed Gbps: %lf\n", sent_gbps, resp_gbps);
+    }
   }
 
   struct ClientRpcCall {
@@ -271,8 +334,13 @@ class ClientImpl final {
   std::vector<std::unique_ptr<GenericStub>> stubs_;
   std::vector<std::thread> workers_;
   std::vector<int> send_count_;
-  std::vector<int> recv_count_;
+  std::vector<int> responsed_count_;
   std::atomic_int total_count;
+
+  std::atomic_uint64_t total_sent_bytes_{0};
+  std::atomic_uint64_t total_responsed_bytes_{0};
+  std::atomic_bool all_finished{false};
+  std::unique_ptr<std::thread> reporter_;
 };
 
 int main(int argc, char **argv) {
