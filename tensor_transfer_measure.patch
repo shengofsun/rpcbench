@@ -1,0 +1,50 @@
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_state.h b/tensorflow/core/distributed_runtime/rpc/grpc_state.h
+index 61c5bc285f..8de08f13a4 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_state.h
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_state.h
+@@ -25,6 +25,7 @@ limitations under the License.
+ #include "tensorflow/core/distributed_runtime/rpc/grpc_client_cq_tag.h"
+ #include "tensorflow/core/distributed_runtime/rpc/grpc_util.h"
+ #include "tensorflow/core/distributed_runtime/tensor_coding.h"
++#include "tensorflow/core/platform/env.h"
+ #include "tensorflow/core/platform/notification.h"
+ 
+ namespace tensorflow {
+@@ -46,6 +47,9 @@ class RPCState : public GrpcClientCQTag {
+            Response* response, StatusCallback done, CallOptions* call_opts,
+            bool fail_fast, int64 timeout_in_ms)
+       : call_opts_(call_opts), done_(std::move(done)) {
++    is_recv_tensor =
++        strcmp(method.c_str(), "/tensorflow.WorkerService/RecvTensor") == 0;
++    start = Env::Default()->NowNanos();
+     context_.set_fail_fast(fail_fast);
+     if (timeout_in_ms > 0) {
+       context_.set_deadline(gpr_time_from_millis(timeout_in_ms, GPR_TIMESPAN));
+@@ -77,12 +81,16 @@ class RPCState : public GrpcClientCQTag {
+       // to Finish for client-side unary calls, ok should never be false
+       s.Update(errors::Internal("unexpected ok value at rpc completion"));
+     }
++    middle = Env::Default()->NowNanos();
+     if (s.ok() && !GrpcMaybeParseProto(&response_buf_, response_)) {
+       s.Update(errors::Internal("could not parse rpc response"));
+     }
+     if (!s.ok()) {
+       VLOG(2) << "Call returned with non-ok status: " << s;
+     }
++    end = Env::Default()->NowNanos();
++    if (is_recv_tensor)
++      printf("duration1: %lu, duration2: %lu\n", middle - start, end - middle);
+     done_(s);
+     delete this;
+   }
+@@ -96,6 +104,10 @@ class RPCState : public GrpcClientCQTag {
+   ::grpc::ByteBuffer response_buf_;
+   ::grpc::Status status_;
+   StatusCallback done_;
++  uint64_t start;
++  uint64_t middle;
++  uint64_t end;
++  bool is_recv_tensor;
+ };
+ 
+ }  // namespace tensorflow
